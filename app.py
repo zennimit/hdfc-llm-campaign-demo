@@ -1,78 +1,121 @@
 import streamlit as st
 import pandas as pd
-import faiss
-from sklearn.cluster import AgglomerativeClustering
-import openai
 import numpy as np
+from sklearn.cluster import AgglomerativeClustering
+import faiss
+import openai
 
+# ——— CONFIG ———
 openai.api_key = st.secrets["OPENAI_API_KEY"]
+DATA_PATH = "data/transactions.csv"
+
+# ——— UI HEADER ———
+st.title("LLM-Augmented Cohort Demo for HDFC Campaigns")
+
+# ——— LOAD & NORMALIZE DATA ———
+df = pd.read_csv(DATA_PATH)
+
+# Auto-rename common variants to user_id
+if "Customer ID" in df.columns:
+    df = df.rename(columns={"Customer ID": "user_id"})
+elif "customer_id" in df.columns:
+    df = df.rename(columns={"customer_id": "user_id"})
+# Add more elifs here if your file uses a different name...
+
+# Debug: show detected columns (remove after this works)
+st.write("Detected columns:", df.columns.tolist())
+
+# Basic sanity check
+if "user_id" not in df.columns or "event_text" not in df.columns:
+    st.error("CSV must contain columns: user_id, event_text")
+    st.stop()
+
+# ——— EMBEDDING & CLUSTERING HELPERS ———
+@st.cache_data
+def embed_texts(texts: list[str]) -> np.ndarray:
+    resp = openai.Embedding.create(
+        model="text-embedding-ada-002",
+        input=texts
+    )
+    return np.array([r["embedding"] for r in resp["data"]], dtype="float32")
 
 @st.cache_data
-def load_data():
-    return pd.read_csv("data/transactions.csv")
+def build_user_medoids(df: pd.DataFrame) -> tuple[dict, dict]:
+    """
+    For each user, cluster their event embeddings and pick one medoid per cluster.
+    Returns:
+      - medoids: { user_id: np.ndarray[[vector, ...], ...] }
+      - user_index: { user_id: idx } mapping to an integer index for FAISS
+    """
+    medoids = {}
+    user_index = {}
+    idx_counter = 0
 
-@st.cache_data
-def embed_text(texts):
-    resp = openai.Embedding.create(model="text-embedding-ada-002", input=texts)
-    return np.array([r["embedding"] for r in resp["data"]])
-
-@st.cache_data
-def build_user_medoids(df):
-    medoids, user_index = {}, {}
     for uid, group in df.groupby("user_id"):
-        embs = embed_text(group["event_text"].tolist())
-        # cluster into 2 clusters (for simplicity)
+        texts = group["event_text"].tolist()
+        embs = embed_texts(texts)
+        # Simple 2-cluster example; tweak n_clusters as needed
         cl = AgglomerativeClustering(n_clusters=2).fit(embs)
-        # pick the first medoid per cluster
-        medoid_idxs = []
+        vectors = []
         for label in np.unique(cl.labels_):
-            idxs = np.where(cl.labels_ == label)[0]
-            # medoid = point with min avg distance
-            sub = embs[idxs]
-            distances = np.linalg.norm(sub[:,None] - sub[None,:], axis=2).mean(axis=1)
-            medoid_idxs.append(idxs[np.argmin(distances)])
-        medoids[uid] = embs[medoid_idxs]
-        user_index[uid] = len(user_index)
+            sub_idxs = np.where(cl.labels_ == label)[0]
+            sub_embs = embs[sub_idxs]
+            # pick medoid = vector with minimal avg distance
+            dists = np.linalg.norm(sub_embs[:, None] - sub_embs[None, :], axis=2).mean(axis=1)
+            medoid_vec = sub_embs[np.argmin(dists)]
+            vectors.append(medoid_vec)
+        medoids[uid] = np.stack(vectors)
+        user_index[uid] = idx_counter
+        idx_counter += len(vectors)
+
     return medoids, user_index
 
-# build FAISS index
-def build_index(medoids, user_index):
+def build_faiss_index(medoids: dict) -> faiss.IndexFlatL2:
     dim = next(iter(medoids.values())).shape[1]
     index = faiss.IndexFlatL2(dim)
-    for uid, vectors in medoids.items():
-        for vec in vectors:
-            index.add(vec[np.newaxis])
+    for vectors in medoids.values():
+        index.add(vectors)
     return index
 
-def search_users(intent_vecs, index, user_index, top_k=50):
+def vector_search(intent_vecs: list[np.ndarray], index: faiss.IndexFlatL2,
+                  user_index: dict, top_k: int = 100) -> list[str]:
+    # search each intent, collect top_k per intent
     D, I = index.search(np.vstack(intent_vecs), top_k)
-    # map back to user_ids (simplest: ignore duplicates)
-    inv = {v:k for k,v in user_index.items()}
-    results = set(inv[i] for i in I.flatten() if i in inv)
-    return list(results)
+    # invert user_index mapping: FAISS id -> user_id
+    inv_map = {v: k for k, v in user_index.items()}
+    hits = set()
+    for row in I:
+        for fid in row:
+            uid = inv_map.get(fid)
+            if uid:
+                hits.add(uid)
+    return list(hits)
 
-st.title("LLM-Augmented Campaign Prototype")
+# ——— BUILD INDEX (with spinner) ———
+with st.spinner("Building user clusters & FAISS index…"):
+    medoids, user_index = build_user_medoids(df)
+    faiss_index = build_faiss_index(medoids)
+st.success(f"Indexed {len(user_index)} users")
 
-df = load_data()
-st.sidebar.write("### Data Preview"); st.sidebar.dataframe(df.head())
+# ——— CAMPAIGN UI ———
+st.header("Run a Campaign")
+goal_text = st.text_input(
+    "Describe your campaign goal in plain English",
+    value="Weekend getaway for flight & hotel bookers"
+)
 
-# 1) Build medoids & index
-medoids, user_index = build_user_medoids(df)
-index = build_index(medoids, user_index)
+if st.button("Generate Cohort"):
+    with st.spinner("Generating intent vectors…"):
+        # Example: derive two intents from the goal
+        intent_prompts = [
+            f"{goal_text} — identify flight-bookers",
+            f"{goal_text} — identify hotel-stayers"
+        ]
+        intent_vecs = [embed_texts([p])[0] for p in intent_prompts]
 
-# 2) Define campaign goal
-goal = st.text_input("Enter Campaign Goal", 
-    "Weekend getaway for flight & hotel bookers")
-if st.button("Run Campaign"):
-    # 3) Have LLM output intent vectors via embedding
-    #    (in production, you'd prompt for NL intents and embed them)
-    intents = [
-      openai.Embedding.create(model="text-embedding-ada-002", 
-        input=f"{goal} — identify flight-bookers")["data"][0]["embedding"],
-      openai.Embedding.create(model="text-embedding-ada-002", 
-        input=f"{goal} — identify hotel-stayers")["data"][0]["embedding"]
-    ]
-    # 4) Vector search
-    users = search_users(intents, index, user_index, top_k=100)
-    st.success(f"Target cohort: {len(users)} users")
-    st.write(users)
+    with st.spinner("Searching for matching users…"):
+        cohort = vector_search(intent_vecs, faiss_index, user_index, top_k=200)
+
+    st.success(f"🎯 Target cohort: {len(cohort)} users")
+    st.write(cohort)
+
