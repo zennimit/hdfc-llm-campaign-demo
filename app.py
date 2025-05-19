@@ -122,3 +122,53 @@ if st.button("Generate Cohort"):
 
     st.success(f"🎯 Target cohort: {len(cohort)} users")
     st.write(cohort)
+
+
+# … keep all your imports and existing code above …
+
+if st.button("Generate Cohort"):
+    # 1) Generate intent vectors & search as before
+    with st.spinner("Generating intent vectors…"):
+        intent_prompts = [
+            f"{goal_text} — identify flight-bookers",
+            f"{goal_text} — identify hotel-stayers"
+        ]
+        intent_vecs = [embed_texts([p])[0] for p in intent_prompts]
+
+    with st.spinner("Searching for matching users…"):
+        # returns all users matching ANY intent
+        cohort = vector_search(intent_vecs, faiss_index, user_index, top_k=200)
+    st.success(f"🎯 Target cohort: {len(cohort)} users")
+    st.write(cohort)
+
+    # 2) Split into segments based on the two intents:
+    #    (you could also intersect, sample, etc.)
+    seg1 = vector_search([intent_vecs[0]], faiss_index, user_index, top_k=200)
+    seg2 = vector_search([intent_vecs[1]], faiss_index, user_index, top_k=200)
+    
+    # 3) Call the LLM to explain each segment + a few users
+    with st.spinner("Asking LLM for rationales…"):
+        messages = [
+            {"role": "system", "content": "You are a campaign reasoning engine."},
+            {"role": "user", "content": f"""
+We ran a credit-card campaign with goal: “{goal_text}”.
+
+**Segment 1**: Flight-bookers (users: {seg1[:5]}… + {len(seg1)-5} more)  
+**Segment 2**: Hotel-stayers (users: {seg2[:5]}… + {len(seg2)-5} more)
+
+For each segment, in natural language:
+1. A one-sentence rationale why this group suits the campaign.  
+2. For the first 5 users in that segment, a one-line explanation why each was selected.  
+"""}
+        ]
+
+        chat = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.7,
+        )
+        rationale = chat.choices[0].message.content
+
+    st.markdown("### Campaign Rationales")
+    st.text(rationale)
+
