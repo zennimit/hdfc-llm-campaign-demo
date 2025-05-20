@@ -2,4 +2,4 @@ streamlit
 faiss-cpu
 pandas
 scikit-learn
-openai==0.27.4
+openai
