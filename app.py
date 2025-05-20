@@ -106,24 +106,54 @@ st.success(f"Indexed {len(user_index)} users")
 st.header("Run a Campaign")
 goal_text = st.text_input(
     "Describe your campaign goal in plain English",
-     value="Weekend getaway for flight & hotel bookers",
-     key="campaign_goal_input"
- )
+    value="Weekend getaway for flight & hotel bookers",
+    key="campaign_goal_input"
+)
 
-if st.button("Generate Cohort", key="generate_cohort_btn"):
-    with st.spinner("Generating intent vectors…"):
+# Single button to do everything
+if st.button("Run Campaign", key="run_campaign_btn"):
+    with st.spinner("Generating cohorts…"):
+        # 1) Build intent embeddings
         intent_prompts = [
             f"{goal_text} — identify flight-bookers",
             f"{goal_text} — identify hotel-stayers"
         ]
         intent_vecs = [embed_texts([p])[0] for p in intent_prompts]
 
-    with st.spinner("Searching for matching users…"):
-        cohort = vector_search(intent_vecs, faiss_index, user_index, top_k=200)
+        # 2) Segment cohorts
+        seg1 = vector_search([intent_vecs[0]], faiss_index, user_index, top_k=200)
+        seg2 = vector_search([intent_vecs[1]], faiss_index, user_index, top_k=200)
 
-    st.success(f"🎯 Target cohort: {len(cohort)} users")
-    st.write(cohort)
+    with st.spinner("Asking LLM for per-user rationales…"):
+        # 3) Prompt the LLM for rationales per user in each segment
+        msg = {
+          "role": "user",
+          "content": f"""
+Campaign Goal: {goal_text}
 
+Segment 1 (Flight-bookers): {seg1}
+Segment 2 (Hotel-stayers): {seg2}
+
+For each segment, generate a CSV-style table where:
+- Column A is the user ID
+- Column B is a one-line rationale (“why this user suits the campaign”)
+
+Output exactly two tables in markdown format, one per segment.
+"""
+        }
+        chat = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful campaign reasoning assistant."},
+                msg
+            ],
+            temperature=0.7
+        )
+        rationale_md = chat.choices[0].message.content
+
+    # 4) Display the markdown tables
+    st.markdown("### Campaign Cohorts & Rationales")
+    st.markdown(rationale_md)
 
 # … keep all your imports and existing code above …
 
