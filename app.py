@@ -168,10 +168,10 @@ total_budget = st.number_input("Total budget (₹)", min_value=0, value=100000)
 # ——— 8) BUDGET-CONSTRAINED SELECTION —————————————————————————————————————
 st.markdown("## Step 8: Limit assignments under budget (greedy)")
 def budget_constrained(df, B):
-     # compute propensity-per-cost ratio, then sort descending by it
-     df = df.copy()
-     df["roi"] = df["propensity"] / df["cost"]
-     df = df.sort_values(by="roi", ascending=False)
+    # compute propensity-per-cost ratio, then sort descending by it
+    df = df.copy()
+    df["roi"] = df["propensity"] / df["cost"]
+    df = df.sort_values(by="roi", ascending=False)
 
     spent = 0
     keep = []
