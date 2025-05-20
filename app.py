@@ -106,10 +106,11 @@ st.success(f"Indexed {len(user_index)} users")
 st.header("Run a Campaign")
 goal_text = st.text_input(
     "Describe your campaign goal in plain English",
-    value="Weekend getaway for flight & hotel bookers"
-)
+     value="Weekend getaway for flight & hotel bookers",
+     key="campaign_goal_input"
+ )
 
-if st.button("Generate Cohort"):
++if st.button("Generate Cohort", key="generate_cohort_btn"):
     with st.spinner("Generating intent vectors…"):
         intent_prompts = [
             f"{goal_text} — identify flight-bookers",
