@@ -128,7 +128,8 @@ st.write("Clusters ranked by relevance:", ranked_clusters[:3],
 st.markdown("## Step 5: Define your available campaigns & costs")
 # expect input as CSV in the text_area: campaign_id,description,cost
 campaign_csv = st.text_area("Paste CSV: campaign_id,description,cost", 
-"""A,10% off flight booking,100
+ """campaign_id,description,cost
+A,10% off flight booking,100
 B,₹500 cashback on hotel,80
 C,Buy-1-Get-1 ride voucher,60""")
 camp_df = pd.read_csv(io.StringIO(campaign_csv))
