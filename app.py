@@ -110,7 +110,7 @@ goal_text = st.text_input(
      key="campaign_goal_input"
  )
 
-+if st.button("Generate Cohort", key="generate_cohort_btn"):
+if st.button("Generate Cohort", key="generate_cohort_btn"):
     with st.spinner("Generating intent vectors…"):
         intent_prompts = [
             f"{goal_text} — identify flight-bookers",
