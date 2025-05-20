@@ -32,24 +32,40 @@ st.dataframe(df.head())
 # ——— 2) AUTO-CREATE ALWAYS-ON GLOBAL CLUSTERS ——————————————————————————————
 st.markdown("## Step 2: Build global clusters")
 @st.cache_data
-def build_global_clusters(df, k):
-    # 1) embed each event_text → we'll average per user to get a user vector
-    texts = df["event_text"].tolist()
-    resp = openai.Embedding.create(
-    model="text-embedding-ada-002",
-    input=texts
-)
+def build_global_clusters(df, k, samples_per_user=5):
+    # 1) Sample up to `samples_per_user` events per user (most recent or random)
+    #    Here we pick the most recent N events for each user
+    df_sorted = df.sort_values("Timestamp")
+    sampled = (
+        df_sorted
+        .groupby("user_id")
+        .tail(samples_per_user)
+        .reset_index(drop=True)
+    )
 
+    # 2) Embed those sampled event_texts in one batch
+    texts = sampled["event_text"].tolist()
+    resp = openai.Embedding.create(
+        model="text-embedding-ada-002",
+        input=texts
+    )
     embs = np.array([d["embedding"] for d in resp["data"]], dtype="float32")
-    df["_emb"] = list(embs)
-    # 2) average per user
-    user_vecs = df.groupby("user_id")["_emb"].apply(lambda vs: np.mean(vs.tolist(), axis=0))
+    sampled["_emb"] = list(embs)
+
+    # 3) Aggregate sampled embeddings into one user vector (mean of up to N samples)
+    user_vecs = (
+        sampled
+        .groupby("user_id")["_emb"]
+        .apply(lambda vs: np.mean(vs.tolist(), axis=0))
+    )
     users = user_vecs.index.tolist()
     matrix = np.vstack(user_vecs.values)
-    # 3) KMeans clustering
+
+    # 4) KMeans clustering on the per-user aggregated vectors
     km = KMeans(n_clusters=k, random_state=42).fit(matrix)
     labels = km.labels_
     centroids = km.cluster_centers_
+
     return users, matrix, labels, centroids
 
 with st.spinner("Clustering users into global cohorts…"):
