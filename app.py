@@ -1,3 +1,4 @@
+import io
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -130,7 +131,7 @@ campaign_csv = st.text_area("Paste CSV: campaign_id,description,cost",
 """A,10% off flight booking,100
 B,₹500 cashback on hotel,80
 C,Buy-1-Get-1 ride voucher,60""")
-camp_df = pd.read_csv(pd.compat.StringIO(campaign_csv))
+camp_df = pd.read_csv(io.StringIO(campaign_csv))
 st.dataframe(camp_df)
 
 # ——— 6) ASSIGN BEST CAMPAIGN PER USER —————————————————————————————————————
