@@ -1,205 +1,212 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.cluster import AgglomerativeClustering
 import faiss
 import openai
+from sklearn.cluster import KMeans
+from sklearn.metrics.pairwise import cosine_similarity
 
-# ——— CONFIG ———
+# ——— CONFIG —————————————————————————————————————————————————————————————————
 openai.api_key = st.secrets["OPENAI_API_KEY"]
 DATA_PATH = "data/transactions.csv"
+NUM_GLOBAL_CLUSTERS = 5   # step 2: how many “always-on” cohorts
 
-# ——— UI HEADER ———
-st.title("LLM-Augmented Cohort Demo for HDFC Campaigns")
-
-# ——— LOAD & NORMALIZE DATA ———
+# ——— 1) INGEST ALL CUSTOMER DATA ——————————————————————————————————————————
+st.title("LLM-Powered Campaign Engine Prototype")
+st.markdown("## Step 1: Load & inspect data")
 df = pd.read_csv(DATA_PATH)
 
-# Auto-rename common variants to user_id
+# normalize column names
 if "Customer ID" in df.columns:
     df = df.rename(columns={"Customer ID": "user_id"})
 elif "customer_id" in df.columns:
     df = df.rename(columns={"customer_id": "user_id"})
-# (Add more elifs here if your CSV uses other variants)
 
-# Debug: show columns before event_text
-st.write("Columns before event_text:", df.columns.tolist())
-
-# Synthesize free-text “event_text” from merchant, category, amount
+# build event_text
 df["event_text"] = (
-    df["Merchant"]
-    + " | "
-    + df["Category"]
-    + " | ₹"
-    + df["Amount (INR)"].astype(str)
+    df["Merchant"] + " | " + df["Category"] + " | ₹" + df["Amount (INR)"].astype(str)
 )
+st.write("Sample rows:")
+st.dataframe(df.head())
 
-# Debug: confirm event_text was added
-st.write("Columns after event_text:", df.columns.tolist())
-
-# Ensure necessary columns exist
-if "user_id" not in df.columns or "event_text" not in df.columns:
-    st.error("CSV must contain columns: user_id, event_text")
-    st.stop()
-
-# ——— EMBEDDING & CLUSTERING HELPERS ———
+# ——— 2) AUTO-CREATE ALWAYS-ON GLOBAL CLUSTERS ——————————————————————————————
+st.markdown("## Step 2: Build global clusters")
 @st.cache_data
-def embed_texts(texts: list[str]) -> np.ndarray:
-    resp = openai.Embedding.create(
-        model="text-embedding-ada-002",
-        input=texts
-    )
-    return np.array([r["embedding"] for r in resp["data"]], dtype="float32")
+def build_global_clusters(df, k):
+    # 1) embed each event_text → we'll average per user to get a user vector
+    texts = df["event_text"].tolist()
+    resp = openai.embeddings.create(model="text-embedding-ada-002", input=texts)
+    embs = np.array([d["embedding"] for d in resp["data"]], dtype="float32")
+    df["_emb"] = list(embs)
+    # 2) average per user
+    user_vecs = df.groupby("user_id")["_emb"].apply(lambda vs: np.mean(vs.tolist(), axis=0))
+    users = user_vecs.index.tolist()
+    matrix = np.vstack(user_vecs.values)
+    # 3) KMeans clustering
+    km = KMeans(n_clusters=k, random_state=42).fit(matrix)
+    labels = km.labels_
+    centroids = km.cluster_centers_
+    return users, matrix, labels, centroids
 
+with st.spinner("Clustering users into global cohorts…"):
+    users, user_matrix, user_labels, cluster_centroids = build_global_clusters(df, NUM_GLOBAL_CLUSTERS)
+cluster_df = pd.DataFrame({
+    "user_id": users,
+    "cluster": user_labels
+})
+st.write(cluster_df["cluster"].value_counts())
+
+# ——— 2a) LLM-GENERATE CLUSTER RATIONALES/NAMES ——————————————————————————
+st.markdown("### Cluster names & rationales (auto-generated)")
 @st.cache_data
-def build_user_medoids(df: pd.DataFrame) -> tuple[dict, dict]:
-    medoids = {}
-    user_index = {}
-    idx_counter = 0
-
-    for uid, group in df.groupby("user_id"):
-        texts = group["event_text"].tolist()
-        embs = embed_texts(texts)
-        # cluster into 2 clusters
-        cl = AgglomerativeClustering(n_clusters=2).fit(embs)
-        vectors = []
-        for label in np.unique(cl.labels_):
-            sub_idxs = np.where(cl.labels_ == label)[0]
-            sub_embs = embs[sub_idxs]
-            # pick medoid: vector with minimal avg distance
-            dists = np.linalg.norm(sub_embs[:, None] - sub_embs[None, :], axis=2).mean(axis=1)
-            vectors.append(sub_embs[np.argmin(dists)])
-        medoids[uid] = np.stack(vectors)
-        user_index[uid] = idx_counter
-        idx_counter += len(vectors)
-
-    return medoids, user_index
-
-def build_faiss_index(medoids: dict) -> faiss.IndexFlatL2:
-    dim = next(iter(medoids.values())).shape[1]
-    index = faiss.IndexFlatL2(dim)
-    for vectors in medoids.values():
-        index.add(vectors)
-    return index
-
-def vector_search(intent_vecs: list[np.ndarray],
-                  index: faiss.IndexFlatL2,
-                  user_index: dict,
-                  top_k: int = 100) -> list[str]:
-    D, I = index.search(np.vstack(intent_vecs), top_k)
-    inv_map = {v: k for k, v in user_index.items()}
-    hits = set()
-    for row in I:
-        for fid in row:
-            uid = inv_map.get(fid)
-            if uid:
-                hits.add(uid)
-    return list(hits)
-
-# ——— BUILD INDEX ———
-with st.spinner("Building user clusters & FAISS index…"):
-    medoids, user_index = build_user_medoids(df)
-    faiss_index = build_faiss_index(medoids)
-st.success(f"Indexed {len(user_index)} users")
-
-# ——— CAMPAIGN UI ———
-st.header("Run a Campaign")
-goal_text = st.text_input(
-    "Describe your campaign goal in plain English",
-    value="Weekend getaway for flight & hotel bookers",
-    key="campaign_goal_input"
-)
-
-# Single button to do everything
-if st.button("Run Campaign", key="run_campaign_btn"):
-    with st.spinner("Generating cohorts…"):
-        # 1) Build intent embeddings
-        intent_prompts = [
-            f"{goal_text} — identify flight-bookers",
-            f"{goal_text} — identify hotel-stayers"
-        ]
-        intent_vecs = [embed_texts([p])[0] for p in intent_prompts]
-
-        # 2) Segment cohorts
-        seg1 = vector_search([intent_vecs[0]], faiss_index, user_index, top_k=200)
-        seg2 = vector_search([intent_vecs[1]], faiss_index, user_index, top_k=200)
-
-    with st.spinner("Asking LLM for per-user rationales…"):
-        # 3) Prompt the LLM for rationales per user in each segment
-        msg = {
-          "role": "user",
-          "content": f"""
-Campaign Goal: {goal_text}
-
-Segment 1 (Flight-bookers): {seg1}
-Segment 2 (Hotel-stayers): {seg2}
-
-For each segment, generate a CSV-style table where:
-- Column A is the user ID
-- Column B is a one-line rationale (“why this user suits the campaign”)
-
-Output exactly two tables in markdown format, one per segment.
+def name_and_rationalize_clusters(centroids, k):
+    names, rationales = [], []
+    for i in range(k):
+        # For each centroid, we ask the LLM to name & describe
+        prompt = f"""
+Here is a cluster centroid in embedding space (vector omitted for brevity). 
+Based on the kinds of purchase events we've seen, suggest:
+1) A short name for this cluster (e.g. "Weekend Shoppers")
+2) A one-sentence rationale describing their common behavior.
 """
-        }
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":"You are a marketing analyst."},
+                      {"role":"user","content":prompt}],
+            temperature=0.7
+        )
+        out = resp.choices[0].message.content.strip().split("\n",1)
+        names.append(out[0].strip())
+        rationales.append(out[1].strip() if len(out)>1 else "")
+    return names, rationales
+
+cluster_names, cluster_rats = name_and_rationalize_clusters(cluster_centroids, NUM_GLOBAL_CLUSTERS)
+for i,(n,r) in enumerate(zip(cluster_names, cluster_rats)):
+    st.markdown(f"**Cluster {i} — {n}**: {r}")
+
+# ——— 3) INPUT CAMPAIGN GOAL —————————————————————————————————————————————
+st.markdown("## Step 3: Define your campaign goal")
+campaign_goal = st.text_input("Campaign goal (natural language)", 
+                              "Weekend getaway for flight & hotel bookers")
+
+# ——— 4) IDENTIFY USER SEGMENTS (match goal → clusters) —————————————————————————
+st.markdown("## Step 4: Select target clusters for this goal")
+@st.cache_data
+def rank_clusters_for_goal(goal, centroids):
+    # embed the goal
+    gv = openai.embeddings.create(model="text-embedding-ada-002", input=[goal])["data"][0]["embedding"]
+    sims = cosine_similarity([gv], centroids)[0]
+    # return cluster indices sorted by descending similarity
+    return list(np.argsort(sims)[::-1]), sims
+
+ranked_clusters, cluster_sims = rank_clusters_for_goal(campaign_goal, cluster_centroids)
+st.write("Clusters ranked by relevance:", ranked_clusters[:3], 
+         "with scores", np.round(cluster_sims[:3],3))
+
+# ——— 5) INPUT CAMPAIGN TYPES + COSTS —————————————————————————————————————
+st.markdown("## Step 5: Define your available campaigns & costs")
+# expect input as CSV in the text_area: campaign_id,description,cost
+campaign_csv = st.text_area("Paste CSV: campaign_id,description,cost", 
+"""A,10% off flight booking,100
+B,₹500 cashback on hotel,80
+C,Buy-1-Get-1 ride voucher,60""")
+camp_df = pd.read_csv(pd.compat.StringIO(campaign_csv))
+st.dataframe(camp_df)
+
+# ——— 6) ASSIGN BEST CAMPAIGN PER USER —————————————————————————————————————
+st.markdown("## Step 6: Assign best campaign to each user (propensity via embedding sim)")
+@st.cache_data
+def compute_propensities(df, camp_df):
+    # embed campaign descriptions
+    descs = camp_df["description"].tolist()
+    resp = openai.embeddings.create(model="text-embedding-ada-002", input=descs)
+    camp_embs = np.array([d["embedding"] for d in resp["data"]], dtype="float32")
+    # reuse user_matrix from step 2
+    # propensity = cosine sim between each user_vec and each campaign_emb
+    sims = cosine_similarity(user_matrix, camp_embs)
+    # build a table
+    rows = []
+    for ui, uid in enumerate(users):
+        best_j = np.argmax(sims[ui])
+        rows.append({
+            "user_id": uid,
+            "campaign_id": camp_df.loc[best_j,"campaign_id"],
+            "propensity": float(sims[ui,best_j]),
+            "cost": float(camp_df.loc[best_j,"cost"])
+        })
+    return pd.DataFrame(rows)
+
+assign_df = compute_propensities(df, camp_df)
+st.dataframe(assign_df.head())
+
+# ——— 7) INPUT TOTAL BUDGET —————————————————————————————————————————————
+st.markdown("## Step 7: Define your total budget")
+total_budget = st.number_input("Total budget (₹)", min_value=0, value=100000)
+
+# ——— 8) BUDGET-CONSTRAINED SELECTION —————————————————————————————————————
+st.markdown("## Step 8: Limit assignments under budget (greedy)")
+def budget_constrained(df, B):
+    # sort by highest propensity/cost ratio
+    df = df.copy().sort_values(by=lambda d: d["propensity"]/d["cost"], ascending=False)
+    spent = 0
+    keep = []
+    for _, row in df.iterrows():
+        if spent + row["cost"] <= B:
+            keep.append(True)
+            spent += row["cost"]
+        else:
+            keep.append(False)
+    df["selected"] = keep
+    return df
+
+final_df = budget_constrained(assign_df, total_budget)
+st.write("Total spent (approx):", int(final_df.loc[final_df["selected"],"cost"].sum()))
+st.dataframe(final_df[final_df["selected"]].head())
+
+# ——— 9) DISPLAY FINAL TABLE WITH RATIONALES ——————————————————————————————
+st.markdown("## Step 9: Final cohorts with LLM rationales")
+selected = final_df[final_df["selected"]]
+for cluster_idx in ranked_clusters[:2]:  # just top-2 clusters for brevity
+    seg_users = cluster_df.loc[cluster_df["cluster"]==cluster_idx,"user_id"]
+    seg_selected = selected[selected["user_id"].isin(seg_users)]
+    if seg_selected.empty: continue
+
+    st.markdown(f"### Cohort {cluster_idx}: {cluster_names[cluster_idx]}")
+    # ask LLM for cohort rationale once
+    rationale = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role":"system","content":"You are a campaign reasoning assistant."},
+            {"role":"user","content":
+f"""Campaign Goal: {campaign_goal}
+Cohort: {cluster_names[cluster_idx]}
+Users: {seg_selected['user_id'].tolist()}
+
+Write a one-sentence rationale why this cohort matches the goal."""
+            }
+        ]
+    ).choices[0].message.content.strip()
+    st.write("**Cohort Rationale:**", rationale)
+
+    # now per-user rationale
+    rows = []
+    for _, row in seg_selected.iterrows():
+        usr, camp = row["user_id"], row["campaign_id"]
         chat = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a helpful campaign reasoning assistant."},
-                msg
-            ],
-            temperature=0.7
+                {"role":"system","content":"You are a campaign reasoning assistant."},
+                {"role":"user","content":
+f"""User ID: {usr}
+User events: {df[df['user_id']==usr]['event_text'].tolist()}
+Assigned Campaign: {camp} - {camp_df.loc[camp_df['campaign_id']==camp,'description'].iloc[0]}
+
+Write a one-line rationale why we picked this campaign for this user."""
+                }
+            ]
         )
-        rationale_md = chat.choices[0].message.content
+        rows.append((usr, camp, chat.choices[0].message.content.strip()))
 
-    # 4) Display the markdown tables
-    st.markdown("### Campaign Cohorts & Rationales")
-    st.markdown(rationale_md)
-
-# … keep all your imports and existing code above …
-
-if st.button("Generate Cohort"):
-    # 1) Generate intent vectors & search as before
-    with st.spinner("Generating intent vectors…"):
-        intent_prompts = [
-            f"{goal_text} — identify flight-bookers",
-            f"{goal_text} — identify hotel-stayers"
-        ]
-        intent_vecs = [embed_texts([p])[0] for p in intent_prompts]
-
-    with st.spinner("Searching for matching users…"):
-        # returns all users matching ANY intent
-        cohort = vector_search(intent_vecs, faiss_index, user_index, top_k=200)
-    st.success(f"🎯 Target cohort: {len(cohort)} users")
-    st.write(cohort)
-
-    # 2) Split into segments based on the two intents:
-    #    (you could also intersect, sample, etc.)
-    seg1 = vector_search([intent_vecs[0]], faiss_index, user_index, top_k=200)
-    seg2 = vector_search([intent_vecs[1]], faiss_index, user_index, top_k=200)
-    
-    # 3) Call the LLM to explain each segment + a few users
-    with st.spinner("Asking LLM for rationales…"):
-        messages = [
-            {"role": "system", "content": "You are a campaign reasoning engine."},
-            {"role": "user", "content": f"""
-We ran a credit-card campaign with goal: “{goal_text}”.
-
-**Segment 1**: Flight-bookers (users: {seg1[:5]}… + {len(seg1)-5} more)  
-**Segment 2**: Hotel-stayers (users: {seg2[:5]}… + {len(seg2)-5} more)
-
-For each segment, in natural language:
-1. A one-sentence rationale why this group suits the campaign.  
-2. For the first 5 users in that segment, a one-line explanation why each was selected.  
-"""}
-        ]
-
-        chat = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.7,
-        )
-        rationale = chat.choices[0].message.content
-
-    st.markdown("### Campaign Rationales")
-    st.text(rationale)
-
+    # display as table
+    result_tbl = pd.DataFrame(rows, columns=["user_id","campaign_id","rationale"])
+    st.table(result_tbl)
