@@ -35,7 +35,11 @@ st.markdown("## Step 2: Build global clusters")
 def build_global_clusters(df, k):
     # 1) embed each event_text → we'll average per user to get a user vector
     texts = df["event_text"].tolist()
-    resp = openai.embeddings.create(model="text-embedding-ada-002", input=texts)
+    resp = openai.Embeddings.create(
+    model="text-embedding-ada-002",
+    input=texts
+)
+
     embs = np.array([d["embedding"] for d in resp["data"]], dtype="float32")
     df["_emb"] = list(embs)
     # 2) average per user
@@ -94,7 +98,7 @@ st.markdown("## Step 4: Select target clusters for this goal")
 @st.cache_data
 def rank_clusters_for_goal(goal, centroids):
     # embed the goal
-    gv = openai.embeddings.create(model="text-embedding-ada-002", input=[goal])["data"][0]["embedding"]
+    gv = openai.Embeddings.create(model="text-embedding-ada-002", input=[goal])["data"][0]["embedding"]
     sims = cosine_similarity([gv], centroids)[0]
     # return cluster indices sorted by descending similarity
     return list(np.argsort(sims)[::-1]), sims
@@ -119,7 +123,7 @@ st.markdown("## Step 6: Assign best campaign to each user (propensity via embedd
 def compute_propensities(df, camp_df):
     # embed campaign descriptions
     descs = camp_df["description"].tolist()
-    resp = openai.embeddings.create(model="text-embedding-ada-002", input=descs)
+    resp = openai.Embeddings.create(model="text-embedding-ada-002", input=descs)
     camp_embs = np.array([d["embedding"] for d in resp["data"]], dtype="float32")
     # reuse user_matrix from step 2
     # propensity = cosine sim between each user_vec and each campaign_emb
